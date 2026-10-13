@@ -38,6 +38,7 @@ PASS  a reference through a raw host is flagged  <-- pinned defect
 PASS  and the flag names the datasets
 PASS  host names compare without case
 PASS  a SERVER through the alias does not hide a raw host in another key  <-- pinned defect
+PASS  an Oracle connection through a raw host is flagged, not passed  <-- pinned defect
 ...
 PASS  a copied dataset is flagged  <-- pinned defect
 ...
@@ -51,27 +52,30 @@ PASS  the encrypted password in the connection never reaches the output  <-- pin
 PASS  a prefix --ap is refused, never expanded  <-- pinned defect
 ...
 PASS  --out without --apply writes nothing at all  <-- pinned defect
+PASS  a name outside the console code page is escaped, so the run still exits 0 with its summary  <-- pinned defect
 ...
 --------------------------------------------------------------------
-152 assertions, 0 failed
+177 assertions, 0 failed
 ```
 
-The full run prints all 152 assertions. Each `...` line above marks a cut.
+The full run prints all 177 assertions. Each `...` line above marks a cut.
 
 ## Requirements
 
 Python 3.9 or newer and nothing else. The tool needs no `arcpy`, no third-party package, no
 7-Zip and no network. The 7z reader uses `struct`, `zlib` and `lzma` from the standard library.
 
-The self-test prints 152 assertions, 0 failed, on each of these interpreters:
+The self-test prints 177 assertions, 0 failed, on each of these interpreters:
 
 | Host | Python | Result |
 |---|---|---|
-| Windows 11 | 3.13.2 | 152 assertions, 0 failed |
-| Ubuntu 24.04 | 3.12.3 | 152 assertions, 0 failed |
-| Docker `python:3.9-slim` | 3.9.25 | 152 assertions, 0 failed |
+| Windows 11 | 3.13.2 | 177 assertions, 0 failed |
+| Ubuntu 24.04 | 3.12.3 | 177 assertions, 0 failed |
+| Windows 11 | 3.9.25 | 177 assertions, 0 failed |
 
-Branch coverage of `sdcheck.py` under `coverage run --branch sdcheck.py --self-test` is 100%.
+Branch coverage of `sdcheck.py` under `coverage run --branch sdcheck.py --self-test` is 100% on
+Windows Python 3.13 (1058 statements, 300 branches, none missed). `coverage` is not installed on
+the Ubuntu host, so coverage there was not measured.
 
 ```
 git clone https://github.com/uhsear/sdcheck.git
@@ -126,9 +130,12 @@ The tool reads one member, `manifest.xml` at the archive root, and nothing else.
 | `RAW HOST` | `ByReference` is true and the server connection names any other host. | FLAGGED |
 | `COPIED` | `ByReference` is false: the data travels inside the `.sd`. | FLAGGED |
 | `COPY ALLOWED` | The same, with `--allow-copied`. | PASS |
-| `NO VERDICT` | `ByReference` is missing, or the reference has no server connection. | NO VERDICT |
+| `NO VERDICT` | `ByReference` is missing, the reference has no server connection, or the connection has a part the tool cannot read (see **Which keys**). | NO VERDICT |
 
 A manifest with no database at all is NO VERDICT. A manifest that cannot be read is NO VERDICT.
+So is a file that raises an unexpected error: that file gets NO VERDICT, and the run goes on to
+the next file. A file or dataset name outside the console code page prints as `\uXXXX` escapes,
+so a redirected run never fails on a name.
 
 **Which connection.** Esri's Administrator API reference for the service manifest defines
 `onServerConnectionString` as the "Path to data location after publishing completes", and
@@ -144,6 +151,16 @@ self-test pins that a raw host there is never reported.
 | `INSTANCE` | The part after `sde:<dbms>:`, cut the same way. A bare port such as `5151` names no host. |
 | `DB_CONNECTION_PROPERTIES` | The value, cut the same way. |
 | `DATABASE` | The server of a UNC path such as `\\fs1\gis\data.gdb`. A local path names no host. |
+
+The tool also fails safe on keys it does not read. These keys carry no host and are allowed:
+`AUTHENTICATION_MODE`, `BRANCH`, `DBCLIENT`, `ENCRYPTED_PASSWORD`, `ENCRYPTED_PASSWORD_UTF8`,
+`HISTORICAL_NAME`, `HISTORICAL_TIMESTAMP`, `IS_GEODATABASE`, `USER` and `VERSION`. Any other key
+(for example `HOSTNAME=` or `DATASOURCE=`), a part with no `=`, and a host key whose value gives no
+host (for example `INSTANCE=sde:sqlserver`) make the database NO VERDICT, because a host could
+hide there. A connection that holds no host and no `DATABASE` path is also NO VERDICT. A
+raw host elsewhere in the same string is still FLAGGED. The reason names the key, never the value.
+An Oracle-style `//host:1521/service` value gives its host, and a `DATABASE` UNC path is read with
+`\` or `/` slashes, or in the `\\?\UNC\` form.
 
 The old guard read `SERVER` only. A connection with `SERVER` set to the alias and
 `DB_CONNECTION_PROPERTIES` set to the raw host passed it. Here, that connection is flagged.
@@ -198,7 +215,7 @@ writes a 7z archive. The reader follows 7-Zip's `DOC/7zFormat.txt` and `DOC/Meth
 | LZMA, LZMA2 and stored (Copy) members | PPMd, or any coder other than the three on the left |
 | Solid and non-solid archives | An encrypted archive (7zAES) |
 | Empty files and directories | Names or folders stored outside the header |
-| CRC checks on the start header, the header and the member | A manifest over 64 MB, refused before decompression |
+| CRC checks on the start header, the header and the member | A manifest that ends more than 64 MB into its block, refused before decompression |
 
 The `--sevenzip` fallback runs only when the reader refuses an archive as unsupported. It runs
 `7z e -so -y <file> manifest.xml`, without `-r`, so 7-Zip matches the name at the archive root
@@ -242,6 +259,34 @@ match was an SD-card checker or an unrelated project.
 - Pro refused to stage a map that held only a basemap (analyzer error 00102). So the NO VERDICT for a
   manifest with no database comes from a synthetic manifest only. A service that truly reads no
   data, such as some geoprocessing services, gets NO VERDICT.
+- The tool reads the first child element of each kind in a manifest. With two `ByReference`
+  elements in one database, only the first counts. Text after a child element inside the
+  connection string is dropped, so `SERVER=ok;<b/>INSTANCE=sde:sqlserver:rawhost` passes.
+- With two `manifest.xml` members at the archive root, the tool reads the first one. `7z e -so`
+  joins both into one stream (measured with 7-Zip 24.08).
+- Values are compared as written. `SERVER="gisdb.example.org"`, `SERVER=tcp:gisdb.example.org,1433`,
+  `gisdb.example.org.` and `SERVER={gisdb.example.org}` are all flagged as `RAW HOST`, even when
+  they name the expected host, so write `--expect-host` in the spelling the connection uses. A
+  port in `--expect-host` flags every connection. This fails safe.
+- A flagged file plus an `--out` that cannot be written exits 2, not 1. The flag is still
+  printed, but a gate that tests only for exit 1 misses it.
+- `--out` with `--apply` overwrites any file it names, including an input `.sd` (measured:
+  `--out keep.sd --apply` replaced `keep.sd` with JSON).
+- With `--sevenzip`, a `.sd` path that starts with `-` is read by 7-Zip as a switch and gives
+  NO VERDICT (7-Zip exited 7). Spaces, `@` and `[ ]` in the path worked. The fallback reads no file list, so a copied
+  dataset's file count is `unknown`. Its output is not size-limited, because
+  `MAX_MANIFEST_BYTES` applies to the built-in reader only. On Windows a bare `--sevenzip 7z` can
+  resolve to a `7z.exe` in the current directory, so give a full path.
+- Two databases with the same `Name` (or two with no name) share one in-package file count,
+  because the count is keyed by name.
+- The host check was cross-checked only against the SQL Server and file geodatabase connections
+  that Pro 3.6 staged. Oracle, PostgreSQL and other DBMS forms are covered by synthetic strings.
+  A form the tool does not know gives NO VERDICT, never a pass.
+- The hard-link, self-extracting (SFX prefix) and multi-volume archive cases were not tested.
+- `--self-test` exits 1 when an assertion fails, the same code as FLAGGED. It also writes a
+  temporary directory and a stub script outside `--apply`, and removes them at the end.
+- The reader holds the whole header, up to 64 MB, in memory. It does not cap the memory that the
+  stream counts of a hostile header can ask for.
 - The 120 second timeout on `--sevenzip` is not exercised by the self-test.
 - Python's `lzma` documentation pairs `FILTER_LZMA1` with `FORMAT_ALONE`. This reader uses it
   with `FORMAT_RAW`. All three interpreters above decode the four Pro archives and the 7-Zip
@@ -249,7 +294,7 @@ match was an SD-card checker or an unrelated project.
 
 ## Test archives
 
-Five archives in `REAL_7Z` were made by 7-Zip 24.08 (x64). Each folder held a `manifest.xml`
+Six archives in `REAL_7Z` were made by 7-Zip 24.08 (x64). Each folder held a `manifest.xml`
 from `_fixture_manifest`, plus the synthetic members the self-test names. The commands were:
 
 ```
@@ -258,7 +303,11 @@ from `_fixture_manifest`, plus the synthetic members the self-test names. The co
 7z a -t7z bcj.sd * -m0=BCJ -m1=LZMA -mhc=off
 7z a -t7z aes.sd * -mhe=on -p<password>
 7z a -t7z ppmd.sd * -m0=PPMd -mhc=off
+7z a -t7z -m0=Copy -mhc=off -ms=off copy7.sd manifest.xml
 ```
+
+`copy7.sd` holds only `manifest.xml`. 7-Zip stores the member CRC in the substreams and writes no
+folder CRC, so the self-test corrupts a byte there and expects `CRC does not match`.
 
 `_build_7z` in the self-test writes further archives for the branches that 7-Zip does not
 write. The 7-Zip archives keep the reader honest against a writer it did not come from.
@@ -275,7 +324,12 @@ write. The 7-Zip archives keep the reader honest against a writer it did not com
   `offline`, `offlineTarget` and `copyDataToServer`.
 - Esri, [Stage Service](https://doc.esri.com/en/arcgis-pro/latest/tool-reference/server/stage-service.html).
 - Esri, [Workspace properties](https://doc.esri.com/en/arcgis-pro/latest/arcpy/functions/workspace-properties.html):
-  `server` and `instance` in `connectionProperties`.
+  the `connectionProperties` keys `server`, `instance`, `database`, `dbClient`, `user`, `version`,
+  `branch`, `authentication_mode`, `historical_name`, `historical_timestamp` and `is_geodatabase`.
+  The page names `server` as the key that carries a host. It does not list `ENCRYPTED_PASSWORD`,
+  `ENCRYPTED_PASSWORD_UTF8` or `DB_CONNECTION_PROPERTIES`, which Pro 3.6 wrote in every SQL Server
+  connection staged here. It does not describe Oracle `//host` values, so that form is covered by
+  a synthetic string only.
 - Esri, [Analyzer warning 24011](https://doc.esri.com/en/arcgis-pro/latest/help/sharing/analyzer-warning-messages/24011-data-source-is-not-registered-with-the-server-and-data-will-be-copied-to-the-server.html).
 - Python, [`lzma`](https://docs.python.org/3/library/lzma.html): `FORMAT_RAW`, filter options
   and `max_length`.

@@ -406,14 +406,22 @@ def _unpack(fh, st, index, need):
         raise ArchiveError("folder %d has no packed stream" % index)
     start = 32 + st.pack_pos + sum(st.pack_sizes[:index])
     left = st.pack_sizes[index]
-    fh.seek(start)
+    try:
+        fh.seek(start)
+    except OverflowError:
+        # A header can claim an offset no file position can hold.
+        raise ArchiveError("packed data starts at byte %d, past any file"
+                           % start)
     if filt is None:
         out = fh.read(min(need, left))
     else:
-        dec = lzma.LZMADecompressor(format=lzma.FORMAT_RAW, filters=[filt])
         parts = []
         got = 0
         try:
+            # The constructor refuses a property set liblzma cannot run,
+            # for example lc=8, so it sits inside the try.
+            dec = lzma.LZMADecompressor(format=lzma.FORMAT_RAW,
+                                        filters=[filt])
             # Each call either fills the request, reaches the end of the
             # stream, or uses up its input. So while bytes are still owed,
             # the decoder always wants more input, never an empty call.
@@ -544,6 +552,9 @@ def parse_manifest(data):
         root = ET.fromstring(data)
     except ET.ParseError as exc:
         raise ManifestError("manifest is not well-formed XML: %s" % exc)
+    except LookupError as exc:
+        # An XML declaration can name an encoding Python does not have.
+        raise ManifestError("manifest declares an unusable encoding: %s" % exc)
     if root.tag != "SVCManifest":
         raise ManifestError("root element is %s, not SVCManifest" % root.tag)
     out = []
@@ -561,45 +572,94 @@ def parse_manifest(data):
 
 
 def _host_part(value):
-    """The host in a SERVER-style value: drop \\instance, ,port, /service."""
-    host = re.split(r"[\\,/]", value.strip())[0]
+    """The host in a SERVER-style value: drop \\instance, ,port, /service.
+
+    Leading slashes go first, so an Oracle-style //host:1521/service value
+    gives the host and not an empty string.
+    """
+    host = re.split(r"[\\,/]", value.strip().lstrip("/"))[0]
     m = re.match(r"^(.+):\d+$", host)
     return m.group(1) if m else host
 
 
-def hosts_in(connection):
-    """[(key, host)] for every key in a connection string that names a host.
+# Keys that carry no host. Every key in a server connection must be on this
+# list or be one of the three host keys read below, or the tool gives NO
+# VERDICT: a host under a key it does not know would otherwise pass.
+# ENCRYPTED_PASSWORD_UTF8 is not on Esri's workspace properties page. Pro 3.6
+# wrote it beside ENCRYPTED_PASSWORD in every SQL Server connection staged here.
+QUIET_KEYS = frozenset([
+    "AUTHENTICATION_MODE", "BRANCH", "DBCLIENT", "ENCRYPTED_PASSWORD",
+    "ENCRYPTED_PASSWORD_UTF8", "HISTORICAL_NAME", "HISTORICAL_TIMESTAMP",
+    "IS_GEODATABASE", "USER", "VERSION"])
+
+
+def _unc_host(value):
+    """(is_unc, host) for a DATABASE value, written with \\ or / slashes."""
+    v = value.replace("/", "\\")
+    low = v.lower()
+    for prefix in ("\\\\?\\unc\\", "\\\\.\\unc\\"):
+        if low.startswith(prefix):
+            return True, v[len(prefix):].split("\\")[0]
+    if low.startswith("\\\\?\\") or low.startswith("\\\\.\\"):
+        return False, ""  # a device-style local path such as \\?\C:\data
+    if v.startswith("\\\\"):
+        return True, v[2:].split("\\")[0]
+    return False, ""
+
+
+def scan(connection):
+    """([(key, host)], [unread key], local) for a connection string.
 
     SERVER and INSTANCE are documented workspace connection properties.
     DB_CONNECTION_PROPERTIES carries the same host in every SQL Server
     connection ArcGIS Pro 3.6 staged here. DATABASE names a host only when it
     is a UNC path to a file geodatabase on a share. Values are never kept,
     only the host part, because the same string holds the password.
+
+    unread lists the keys whose value may hold a host this tool cannot read:
+    a key it does not know, a host key whose value gives no host, and a part
+    with no key at all. local is True when a DATABASE value names no host.
     """
-    found = []
+    found, unread, local = [], [], False
     for part in connection.split(";"):
         key, sep, value = part.partition("=")
         key = key.strip().upper()
         value = value.strip()
-        if not sep or not value:
+        if not part.strip():
             continue
+        if not sep:
+            unread.append("(no key)")
+            continue
+        if not value:
+            continue
+        host = ""
         if key in ("SERVER", "DB_CONNECTION_PROPERTIES"):
             host = _host_part(value)
         elif key == "INSTANCE":
             pieces = value.split(":", 2)
             if len(pieces) == 3 and pieces[0].lower() == "sde":
                 host = _host_part(pieces[2])
-            else:
+            elif value.isdigit():
                 # A bare port such as 5151 is an application-server
                 # connection, which names no database host here.
                 continue
-        elif key == "DATABASE" and value.startswith("\\\\"):
-            host = value[2:].split("\\")[0]
-        else:
+        elif key == "DATABASE":
+            is_unc, host = _unc_host(value)
+            if not is_unc:
+                local = True
+                continue
+        elif key in QUIET_KEYS:
             continue
         if host:
             found.append((key, host))
-    return found
+        else:
+            unread.append(key)
+    return found, sorted(set(unread)), local
+
+
+def hosts_in(connection):
+    """[(key, host)] for every key in a connection string that names a host."""
+    return scan(connection)[0]
 
 
 # The verdict for one database.
@@ -624,16 +684,23 @@ def judge_database(db, expect_hosts, allow_copied, packed_files=None):
         return UNKNOWN, "ByReference is missing or not true/false"
     if not db["connection"]:
         return UNKNOWN, "referenced, but the manifest has no server connection"
-    hosts = hosts_in(db["connection"])
+    hosts, unread, local = scan(db["connection"])
     bad = sorted(set("%s=%s" % (k, h) for k, h in hosts
                      if h.lower() not in expect))
     if bad:
         return RAW_HOST, ("live connection names %s, not an expected host; "
                           "dataset(s): %s" % (", ".join(bad), names))
+    if unread:
+        return UNKNOWN, ("the connection has a part this tool cannot read "
+                         "(%s), so a host could hide there"
+                         % ", ".join(unread))
     if hosts:
         return OK, ("referenced through %s"
                     % ", ".join(sorted(set(h for _, h in hosts))))
-    return OK, "referenced, and the connection names no host"
+    if local:
+        return OK, "referenced, and the connection names no host"
+    return UNKNOWN, ("the connection holds no host and no database path, "
+                     "so there is nothing to check")
 
 
 def judge(dbs, expect_hosts, allow_copied, packed=None):
@@ -715,6 +782,14 @@ def check_file(path, expect_hosts, allow_copied, sevenzip=None):
         result["exit"] = EXIT_NO_VERDICT
         result["rows"] = [("-", UNKNOWN, str(exc))]
         return result
+    except Exception as exc:
+        # Backstop: a crash on one hostile file must not end the run with a
+        # traceback (exit 1, the code for FLAGGED) and leave later files
+        # unchecked. It is a NO VERDICT, never a pass.
+        result["exit"] = EXIT_NO_VERDICT
+        result["rows"] = [("-", UNKNOWN, "unexpected %s while reading the "
+                           "file; no verdict" % type(exc).__name__)]
+        return result
     result["exit"], result["rows"] = judge(dbs, expect_hosts, allow_copied,
                                            packed)
     return result
@@ -724,12 +799,21 @@ VERDICT_WORD = {EXIT_PASS: "PASS", EXIT_FLAGGED: "FLAGGED",
                 EXIT_NO_VERDICT: "NO VERDICT"}
 
 
+def _safe(text):
+    """text with every non-ASCII character escaped, so print() cannot fail.
+
+    A redirected stdout on Windows uses a legacy code page, and a database
+    or file name outside it would otherwise raise UnicodeEncodeError.
+    """
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
 def describe(result):
-    lines = ["%s: %s" % (result["path"], VERDICT_WORD[result["exit"]])]
+    lines = ["%s: %s" % (_safe(result["path"]), VERDICT_WORD[result["exit"]])]
     if result["reader"] != "stdlib":
-        lines.append("  read with %s" % result["reader"])
+        lines.append("  read with %s" % _safe(result["reader"]))
     for name, cls, reason in result["rows"]:
-        lines.append("  %-12s %s: %s" % (cls, name, reason))
+        lines.append("  %-12s %s: %s" % (cls, _safe(name), _safe(reason)))
     return lines
 
 
@@ -964,6 +1048,30 @@ REAL_7Z = {
         'CgGhgOjcAAAFARkEAAAAABEbAG0AYQBuAGkAZgBlAHMAdAAuAHgAbQBsAAAAGQAU'
         'CgEA2HlukuJX3QEVBgEAIAAAAAAA'
     ),
+    'copy7': (
+        'N3q8ryccAASZOtJFkAMAAAAAAABiAAAAAAAAAOeSuxw8U1ZDTWFuaWZlc3QgeHNp'
+        'OnR5cGU9J3R5cGVuczpTVkNNYW5pZmVzdCcgeG1sbnM6eHNpPSdodHRwOi8vd3d3'
+        'LnczLm9yZy8yMDAxL1hNTFNjaGVtYS1pbnN0YW5jZScgeG1sbnM6dHlwZW5zPSdo'
+        'dHRwOi8vd3d3LmVzcmkuY29tL3NjaGVtYXMvQXJjR0lTLzMuNi4wJz48RGF0YWJh'
+        'c2VzIHhzaTp0eXBlPSd0eXBlbnM6QXJyYXlPZlNWQ0RhdGFiYXNlJz48U1ZDRGF0'
+        'YWJhc2UgeHNpOnR5cGU9J3R5cGVuczpTVkNEYXRhYmFzZSc+PE5hbWU+YXNzZXRz'
+        'PC9OYW1lPjxJblBhY2thZ2VQYXRoPjwvSW5QYWNrYWdlUGF0aD48T25QcmVtaXNl'
+        'Q29ubmVjdGlvblN0cmluZz5TRVJWRVI9YXV0aG9yLXBjLmV4YW1wbGUubmV0O0RB'
+        'VEFCQVNFPXNjcmF0Y2g8L09uUHJlbWlzZUNvbm5lY3Rpb25TdHJpbmc+PERhdGFz'
+        'ZXRzIHhzaTp0eXBlPSd0eXBlbnM6QXJyYXlPZlNWQ0RhdGFzZXQnPjxTVkNEYXRh'
+        'c2V0IHhzaTp0eXBlPSd0eXBlbnM6U1ZDRGF0YXNldCc+PE5hbWU+cm9hZHM8L05h'
+        'bWU+PERhdGFzZXRUeXBlPmVzcmlEVEZlYXR1cmVDbGFzczwvRGF0YXNldFR5cGU+'
+        'PC9TVkNEYXRhc2V0PjwvRGF0YXNldHM+PEJ5UmVmZXJlbmNlPnRydWU8L0J5UmVm'
+        'ZXJlbmNlPjxPblNlcnZlckNvbm5lY3Rpb25TdHJpbmc+RU5DUllQVEVEX1BBU1NX'
+        'T1JEPWMyVmpjbVYwTFc1dmRDMXlaV0ZzO1NFUlZFUj1naXNkYi5leGFtcGxlLm9y'
+        'ZztJTlNUQU5DRT1zZGU6c3Fsc2VydmVyOmdpc2RiLmV4YW1wbGUub3JnO0RCQ0xJ'
+        'RU5UPXNxbHNlcnZlcjtEQl9DT05ORUNUSU9OX1BST1BFUlRJRVM9Z2lzZGIuZXhh'
+        'bXBsZS5vcmc7REFUQUJBU0U9YXNzZXRzO1VTRVI9cmVhZGVyO0FVVEhFTlRJQ0FU'
+        'SU9OX01PREU9REJNUzwvT25TZXJ2ZXJDb25uZWN0aW9uU3RyaW5nPjwvU1ZDRGF0'
+        'YWJhc2U+PC9EYXRhYmFzZXM+PC9TVkNNYW5pZmVzdD4BBAYAAQmDkAAHCwEAAQEA'
+        'DIOQAAgKAaGA6NwAAAUBGQwAAAAAAAAAAAAAAAARGwBtAGEAbgBpAGYAZQBzAHQA'
+        'LgB4AG0AbAAAABkAFAoBACu3ddlKW90BFQYBACAAAAAAAA=='
+    ),
 }
 
 
@@ -1086,6 +1194,19 @@ def _self_test_body(check, raises, tmp, passed, failed):
            "a PPMd member names the coder it cannot decode", Unsupported,
            "coder 030401")
 
+    copy7 = real("copy7")
+    a7 = arc(copy7)
+    check(a7.streams.folders[0].crc is None
+          and member(copy7, MANIFEST_NAME) == _fixture_manifest([alias_db]),
+          "a Copy archive made by 7-Zip keeps the member CRC in the "
+          "substreams, with no folder CRC, and reads back")
+    bad = bytearray(copy7)
+    bad[32 + 5] ^= 0xFF
+    raises(lambda: member(bytes(bad), MANIFEST_NAME),
+           "a flipped byte in a 7-Zip archive with no folder CRC fails the "
+           "member CRC  <-- pinned defect", ArchiveError,
+           "manifest.xml CRC does not match")
+
     # ---- archives built here, for the branches 7-Zip never writes
     print("-- reader branches")
     files = [("manifest.xml", _fixture_manifest([alias_db])),
@@ -1118,6 +1239,30 @@ def _self_test_body(check, raises, tmp, passed, failed):
     raises(lambda: _Buf(b"\x01").expect(K_END, "end"),
            "an unexpected property id is named in the error", ArchiveError,
            "expected end")
+
+    def rehead(blob, fn):
+        """blob with its header rewritten by fn, and every CRC redone."""
+        off, size, _ = struct.unpack("<QQI", blob[12:32])
+        head = fn(blob[32 + off:32 + off + size])
+        start = struct.pack("<QQI", off, len(head),
+                            zlib.crc32(head) & 0xFFFFFFFF)
+        return (MAGIC + b"\x00\x04"
+                + struct.pack("<I", zlib.crc32(start) & 0xFFFFFFFF) + start
+                + blob[32:32 + off] + head)
+
+    far = rehead(plain, lambda h: h[:3] + b"\xff"
+                 + (1 << 63).to_bytes(8, "little") + h[4:])
+    raises(lambda: member(far, "manifest.xml"),
+           "a pack offset no file position can hold is an archive error, "
+           "not an OverflowError  <-- pinned defect", ArchiveError,
+           "past any file")
+    lc8 = rehead(_build_7z(files, coder="lzma2"), lambda h: h.replace(
+        b"\x21\x21\x01\x10",
+        b"\x23\x03\x01\x01\x05\x08" + (1 << 16).to_bytes(4, "little")))
+    raises(lambda: member(lc8, "manifest.xml"),
+           "LZMA properties that liblzma refuses (lc=8) are an archive "
+           "error, not a lzma traceback  <-- pinned defect", ArchiveError,
+           "corrupt")
 
     bad = bytearray(plain)
     bad[32 + 5] ^= 0xFF
@@ -1379,6 +1524,34 @@ def _self_test_body(check, raises, tmp, passed, failed):
           "a local path names no host")
     check(hosts_in("SERVER=,1433") == [], "a value that is only a port "
           "names no host")
+    check(hosts_in("INSTANCE=sde:sqlserver") == []
+          and hosts_in("INSTANCE=foo:bar:sqlnode2") == [],
+          "an INSTANCE with two parts, or three under another prefix, "
+          "names no host  <-- pinned defect")
+    check(hosts_in("INSTANCE=sde:oracle11g://rawhost.example.net:1521/orcl")
+          == [("INSTANCE", "rawhost.example.net")],
+          "an Oracle //host:port/service instance gives its host  "
+          "<-- pinned defect")
+    check(hosts_in("DATABASE=//fs1/gis/a.gdb") == [("DATABASE", "fs1")]
+          and hosts_in("DATABASE=\\\\?\\UNC\\fs1\\gis\\a.gdb")
+          == [("DATABASE", "fs1")]
+          and hosts_in("DATABASE=\\\\.\\unc\\fs1\\gis\\a.gdb")
+          == [("DATABASE", "fs1")],
+          "a UNC path with forward slashes, or in the \\\\?\\UNC\\ form, "
+          "names its file server  <-- pinned defect")
+    check(scan("DATABASE=\\\\?\\C:\\data\\a.gdb") == ([], [], True)
+          and scan("DATABASE=\\\\.\\C:\\data\\a.gdb") == ([], [], True),
+          "a device-style local path names no host")
+    check(scan("DATABASE=//")[1] == ["DATABASE"],
+          "a UNC path with no server is unread, not a pass")
+    check(scan("HOST=x;SERVER=ok;novalue;USER=u;")
+          == ([("SERVER", "ok")], ["(no key)", "HOST"], False),
+          "an unknown key and a part with no key are unread; a trailing "
+          "semicolon is not  <-- pinned defect")
+    check(scan("SERVER=,1433")[1] == ["SERVER"]
+          and scan("INSTANCE=foo:bar:sqlnode2")[1] == ["INSTANCE"]
+          and scan("INSTANCE=5151")[1] == [],
+          "a host key with no readable host is unread, a bare port is not")
 
     # ---- verdicts
     print("-- verdicts")
@@ -1406,6 +1579,28 @@ def _self_test_body(check, raises, tmp, passed, failed):
     code, rows = verdict([local])
     check(code == EXIT_PASS and "names no host" in rows[0][2],
           "a referenced local path passes and says it names no host")
+    ora = ("ora", "true", "INSTANCE=sde:oracle11g://%s:1521/orcl;"
+           "DBCLIENT=oracle;USER=u" % RAW, "", ["x"])
+    check(classes([ora]) == [RAW_HOST],
+          "an Oracle connection through a raw host is flagged, not passed  "
+          "<-- pinned defect")
+    for label, conn in (
+            ("a host under a key the tool does not read", "DATASOURCE=" + RAW),
+            ("a key it does not know beside a good SERVER",
+             "SERVER=%s;HOSTNAME=%s;DBCLIENT=sqlserver;USER=u" % (ALIAS, RAW)),
+            ("no host key at all", "FOO=bar"),
+            ("a client and a user but no host or path",
+             "DBCLIENT=oracle;USER=u")):
+        code, rows = verdict([("x", "true", conn, "", [])])
+        check(code == EXIT_NO_VERDICT and rows[0][1] == UNKNOWN
+              and RAW not in rows[0][2],
+              "%s gets no verdict, never a pass  <-- pinned defect" % label)
+    check(classes([("x", "true", "SERVER=%s;FOO=bar" % RAW, "", [])])
+          == [RAW_HOST], "a raw host is still flagged when another part is "
+          "unread")
+    check("HOSTNAME" in verdict([("x", "true", "SERVER=%s;HOSTNAME=%s;"
+                                  % (ALIAS, RAW), "", [])])[1][0][2],
+          "and the reason names the unread key")
     code, rows = verdict([copy_db])
     check(code == EXIT_FLAGGED and rows[0][1] == COPIED,
           "a copied dataset is flagged  <-- pinned defect")
@@ -1463,6 +1658,27 @@ def _self_test_body(check, raises, tmp, passed, failed):
     r = check_file(os.path.join(tmp, "missing.sd"), [ALIAS], False)
     check(r["exit"] == EXIT_NO_VERDICT and r["rows"][0][1] == UNKNOWN,
           "a file that does not exist is no verdict")
+    badenc = b'<?xml version="1.0" encoding="bogus"?><SVCManifest/>'
+    raises(lambda: parse_manifest(badenc),
+           "a manifest that declares an unknown encoding is a manifest "
+           "error, not a LookupError  <-- pinned defect", ManifestError,
+           "unusable encoding")
+    r = check_file(put("enc.sd", _build_7z([("manifest.xml", badenc)])),
+                   [ALIAS], False)
+    check(r["exit"] == EXIT_NO_VERDICT and "unusable encoding" in
+          r["rows"][0][2], "and that file is no verdict")
+    real_read = globals()["read_archive"]
+
+    def crash(fh):
+        raise RuntimeError("synthetic")
+    globals()["read_archive"] = crash
+    try:
+        r = check_file(pro, [ALIAS], False)
+    finally:
+        globals()["read_archive"] = real_read
+    check(r["exit"] == EXIT_NO_VERDICT and "unexpected RuntimeError" in
+          r["rows"][0][2], "a crash on one file is a no verdict for that "
+          "file, never a traceback  <-- pinned defect")
     r = check_file(put("sub.sd", _build_7z([("sub/manifest.xml", b"x")])),
                    [ALIAS], False)
     check(r["exit"] == EXIT_NO_VERDICT and "no manifest.xml" in
@@ -1477,12 +1693,18 @@ def _self_test_body(check, raises, tmp, passed, failed):
         "log = open(sys.argv[0] + '.log', 'w')\n"
         "log.write(repr(sys.argv[1:]) + '|' + repr(sys.stdin.read()))\n"
         "log.close()\n"
-        "if sys.argv[-2].endswith('fail.sd'):\n"
+        "name = sys.argv[-2]\n"
+        "if name.endswith('fail.sd'):\n"
         "    sys.exit(2)\n"
-        "data = open(sys.argv[-2].replace('.sd', '.xml'), 'rb').read()\n"
+        "if name.endswith('quiet.sd'):\n"
+        "    sys.exit(0)\n"
+        "data = open(name.replace('.sd', '.xml'), 'rb').read()\n"
         "getattr(sys.stdout, 'buffer', sys.stdout).write(data)\n"
+        "if name.endswith('partial.sd'):\n"
+        "    sys.exit(2)\n"
     ).encode("ascii"))
     put("bcj.xml", _fixture_manifest([alias_db]))
+    put("partial.xml", _fixture_manifest([alias_db]))
     r = check_file(bcj, [ALIAS], False, [sys.executable, stub])
     check(r["exit"] == EXIT_PASS and r["reader"].startswith("sevenzip"),
           "--sevenzip reads what the stdlib reader refuses")
@@ -1497,6 +1719,17 @@ def _self_test_body(check, raises, tmp, passed, failed):
     r = check_file(fail, [ALIAS], False, [sys.executable, stub])
     check(r["exit"] == EXIT_NO_VERDICT and "exited 2" in r["rows"][0][2],
           "a 7-Zip that fails is no verdict, never a pass")
+    partial = put("partial.sd", real("bcj"))
+    r = check_file(partial, [ALIAS], False, [sys.executable, stub])
+    check(r["exit"] == EXIT_NO_VERDICT and "exited 2 with" in r["rows"][0][2],
+          "a 7-Zip that prints a valid manifest and then exits 2 is no "
+          "verdict, its output untrusted  <-- pinned defect")
+    silent = put("quiet.sd", real("bcj"))
+    r = check_file(silent, [ALIAS], False, [sys.executable, stub])
+    check(r["exit"] == EXIT_NO_VERDICT
+          and "exited 0 with 0 bytes" in r["rows"][0][2],
+          "a 7-Zip that exits 0 and prints nothing is no verdict  "
+          "<-- pinned defect")
     r = check_file(bcj, [ALIAS], False, [os.path.join(tmp, "no-such-7z")])
     check(r["exit"] == EXIT_NO_VERDICT and "could not run" in
           r["rows"][0][2], "a 7-Zip that is not there is no verdict")
@@ -1565,6 +1798,24 @@ def _self_test_body(check, raises, tmp, passed, failed):
     code, _, err = run(base + ["--out", tmp, "--apply"])
     check(code == EXIT_NO_VERDICT and "could not write" in err,
           "an --out that cannot be written exits 2 and says so")
+    check(_safe(u"a\u03a9\u516c") == "a\\u03a9\\u516c",
+          "non-ASCII text is escaped, not dropped")
+    greek = put("greek.sd", _build_7z([("manifest.xml", _fixture_manifest(
+        [(u"assets \u03a9", "true", _sde(ALIAS), "", [u"roads \u516c"])]))]))
+    raw_out = io.BytesIO()
+    saved = sys.stdout
+    # A redirected stdout on Windows is a legacy code page, not UTF-8.
+    sys.stdout = io.TextIOWrapper(raw_out, encoding="cp1252")
+    try:
+        code = main([greek, "--expect-host", ALIAS])
+        sys.stdout.flush()
+        shown = raw_out.getvalue()
+    finally:
+        sys.stdout = saved
+    check(code == EXIT_PASS and b"assets \\u03a9" in shown
+          and b"1 pass" in shown,
+          "a name outside the console code page is escaped, so the run "
+          "still exits 0 with its summary  <-- pinned defect")
     saved = sys.argv
     sys.argv = ["sdcheck.py", pro, "--expect-host", ALIAS]
     try:
@@ -1669,7 +1920,7 @@ def main(argv=None):
              codes.count(EXIT_NO_VERDICT)))
     code = combine(codes)
     if args.out and not args.apply:
-        print("%s not written: pass --apply to write it." % args.out)
+        print("%s not written: pass --apply to write it." % _safe(args.out))
     elif args.out:
         doc = [{"path": r["path"], "verdict": VERDICT_WORD[r["exit"]],
                 "exit": r["exit"], "reader": r["reader"],
@@ -1679,10 +1930,10 @@ def main(argv=None):
             with open(args.out, "w") as fh:
                 json.dump(doc, fh, indent=2)
         except (IOError, OSError) as exc:
-            print("error: could not write %s: %s" % (args.out, exc),
+            print(_safe("error: could not write %s: %s" % (args.out, exc)),
                   file=sys.stderr)
             return EXIT_NO_VERDICT
-        print("wrote %s" % args.out)
+        print("wrote %s" % _safe(args.out))
     return code
 
 
